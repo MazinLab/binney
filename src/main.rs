@@ -9,6 +9,8 @@ use winnow::Bytes;
 
 use polars::prelude::*;
 
+use clap;
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 struct HeaderPacket {
     board: u8,
@@ -59,6 +61,7 @@ impl Photons {
 enum BinneyError<T> {
     IOError(std::io::Error),
     ParseError(winnow::error::ErrMode<T>),
+    PolarsError(PolarsError),
 }
 
 impl<T> From<std::io::Error> for BinneyError<T> {
@@ -70,6 +73,12 @@ impl<T> From<std::io::Error> for BinneyError<T> {
 impl<T> From<winnow::error::ErrMode<T>> for BinneyError<T> {
     fn from(error: winnow::error::ErrMode<T>) -> BinneyError<T> {
         BinneyError::ParseError(error)
+    }
+}
+
+impl<T> From<PolarsError> for BinneyError<T> {
+    fn from(error: PolarsError) -> BinneyError<T> {
+        BinneyError::PolarsError(error)
     }
 }
 
@@ -175,8 +184,12 @@ fn read_file(
     Ok((storage, header))
 }
 
-fn main() -> Result<(), BinneyError<ContextError>> {
-    let (photons, header) = read_file("/tmp/1602050064.bin", None)?;
+fn to_parquet(
+    binfile: &str,
+    parquet: &str,
+    sorted: bool,
+) -> Result<HeaderPacket, BinneyError<ContextError>> {
+    let (photons, header) = read_file(binfile, None)?;
     let xs = Series::new("x", photons.iter().map(|i| i.x).collect::<Vec<u8>>());
     let ys = Series::new("y", photons.iter().map(|i| i.y).collect::<Vec<u8>>());
     let ts = Series::new(
@@ -192,18 +205,19 @@ fn main() -> Result<(), BinneyError<ContextError>> {
         photons.iter().map(|i| i.baseline).collect::<Vec<i32>>(),
     );
 
-    let mut df = DataFrame::new(vec![xs, ys, ts, ps, bs])
-        .unwrap()
-        .sort(["timestamp"], Default::default())
-        .unwrap();
+    let mut df = DataFrame::new(vec![xs, ys, ts, ps, bs])?;
+    if sorted {
+        df = df.sort(["timestamp"], Default::default())?
+    }
 
-    ParquetWriter::new(&mut std::fs::File::create("/tmp/test.parquet")?)
-        .finish(&mut df)
-        .unwrap();
+    ParquetWriter::new(&mut std::fs::File::create(parquet)?).finish(&mut df)?;
 
-    Ok(())
+    Ok(header)
 }
 
+fn main() -> Result<(), BinneyError<ContextError>> {
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
