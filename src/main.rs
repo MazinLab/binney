@@ -7,6 +7,8 @@ use winnow::prelude::*;
 use winnow::token::literal;
 use winnow::Bytes;
 
+use polars::prelude::*;
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 struct HeaderPacket {
     board: u8,
@@ -154,9 +156,29 @@ fn read_file(
 
 fn main() -> Result<(), BinneyError<ContextError>> {
     let (photons, header) = read_file("/tmp/1602050064.bin", None)?;
+    let xs = Series::new("x", photons.iter().map(|i| i.x).collect::<Vec<u16>>());
+    let ys = Series::new("y", photons.iter().map(|i| i.y).collect::<Vec<u16>>());
+    let ts = Series::new(
+        "timestamp",
+        photons.iter().map(|i| i.timestamp).collect::<Vec<u64>>(),
+    );
+    let ps = Series::new(
+        "phase",
+        photons.iter().map(|i| i.phase).collect::<Vec<i32>>(),
+    );
+    let bs = Series::new(
+        "baseline",
+        photons.iter().map(|i| i.baseline).collect::<Vec<i32>>(),
+    );
 
-    println!("{:?}", photons);
-    println!("{:#?}", header);
+    let mut df = DataFrame::new(vec![xs, ys, ts, ps, bs])
+        .unwrap()
+        .sort(["timestamp"], Default::default())
+        .unwrap();
+
+    ParquetWriter::new(&mut std::fs::File::create("/tmp/test.parquet")?)
+        .finish(&mut df)
+        .unwrap();
 
     Ok(())
 }
