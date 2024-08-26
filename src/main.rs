@@ -18,8 +18,8 @@ struct HeaderPacket {
 
 #[derive(Debug, PartialEq)]
 struct DataPacket {
-    x: u16,
-    y: u16,
+    x: u8,
+    y: u8,
     timestamp: u16,
     phase: i32,
     baseline: i32,
@@ -27,11 +27,32 @@ struct DataPacket {
 
 #[derive(Debug, PartialEq, Clone)]
 struct Photon {
-    x: u16,
-    y: u16,
+    x: u8,
+    y: u8,
     timestamp: u64,
     phase: i32,
     baseline: i32,
+}
+
+#[derive(Debug)]
+struct Photons {
+    x: Vec<u8>,
+    y: Vec<u8>,
+    timestamp: Vec<u64>,
+    phase: Vec<i32>,
+    baseline: Vec<i32>,
+}
+
+impl Photons {
+    fn with_capacity(capacity: usize) -> Photons {
+        Photons {
+            x: Vec::with_capacity(capacity),
+            y: Vec::with_capacity(capacity),
+            timestamp: Vec::with_capacity(capacity),
+            phase: Vec::with_capacity(capacity),
+            baseline: Vec::with_capacity(capacity),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -80,8 +101,8 @@ fn parse_header(input: &mut Stream<'_>) -> PResult<HeaderPacket> {
 fn parse_data(input: &mut Stream<'_>) -> PResult<DataPacket> {
     let fields: (u16, u16, u16, i32, i32) = bits::<_, _, ContextError<(String, usize)>, _, _>((
         // We verify that this is not a padding packet or a header packet
-        take(10usize).verify(|i| *i < 0b0111111100),
-        take(10usize),
+        take(10usize).verify(|i| *i < 256),
+        take(10usize).verify(|i| *i < 256),
         take(9usize),
         // Use an arithmetic right shift to sign extend these
         take(18usize).map(|input: i32| input.wrapping_shl(32 - 17).wrapping_shr(32 - 17)),
@@ -91,8 +112,8 @@ fn parse_data(input: &mut Stream<'_>) -> PResult<DataPacket> {
     .map_err(|_| ErrMode::<ContextError>::Cut(ContextError::new()))?;
 
     PResult::Ok(DataPacket {
-        x: fields.0,
-        y: fields.1,
+        x: fields.0 as u8,
+        y: fields.1 as u8,
         timestamp: fields.2,
         phase: fields.3,
         baseline: fields.4,
@@ -156,8 +177,8 @@ fn read_file(
 
 fn main() -> Result<(), BinneyError<ContextError>> {
     let (photons, header) = read_file("/tmp/1602050064.bin", None)?;
-    let xs = Series::new("x", photons.iter().map(|i| i.x).collect::<Vec<u16>>());
-    let ys = Series::new("y", photons.iter().map(|i| i.y).collect::<Vec<u16>>());
+    let xs = Series::new("x", photons.iter().map(|i| i.x).collect::<Vec<u8>>());
+    let ys = Series::new("y", photons.iter().map(|i| i.y).collect::<Vec<u8>>());
     let ts = Series::new(
         "timestamp",
         photons.iter().map(|i| i.timestamp).collect::<Vec<u64>>(),
