@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-polars = { version = "0.42.0", features = ["ndarray", "bigidx", "performant", "lazy", "fmt", "streaming"] }
+polars = { version = "0.42.0", features = ["ndarray", "bigidx", "performant", "lazy", "parquet", "ipc", "fmt", "streaming"] }
 winnow = { version = "0.6.18", features = ["simd"] }
