@@ -1,5 +1,7 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+use std::path::PathBuf;
 
 use winnow::binary::bits::{bits, take};
 use winnow::error::{ContextError, ErrMode};
@@ -7,9 +9,11 @@ use winnow::prelude::*;
 use winnow::token::literal;
 use winnow::Bytes;
 
+use hashbrown::HashMap;
+
 use polars::prelude::*;
 
-use clap;
+use rayon::prelude::*;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 struct HeaderPacket {
@@ -27,19 +31,9 @@ struct DataPacket {
     baseline: i32,
 }
 
-#[derive(Debug, PartialEq, Clone)]
-struct Photon {
-    x: u8,
-    y: u8,
-    timestamp: u64,
-    phase: i32,
-    baseline: i32,
-}
-
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Photons {
-    x: Vec<u8>,
-    y: Vec<u8>,
+    xy: Vec<u16>,
     timestamp: Vec<u64>,
     phase: Vec<i32>,
     baseline: Vec<i32>,
@@ -48,12 +42,59 @@ struct Photons {
 impl Photons {
     fn with_capacity(capacity: usize) -> Photons {
         Photons {
-            x: Vec::with_capacity(capacity),
-            y: Vec::with_capacity(capacity),
+            xy: Vec::with_capacity(capacity),
             timestamp: Vec::with_capacity(capacity),
             phase: Vec::with_capacity(capacity),
             baseline: Vec::with_capacity(capacity),
         }
+    }
+}
+
+/// Represents a range of us gen2 timestamps
+///
+/// This is intentionally opaque to force you to use the provided methods for
+/// operations which correctly handle counter overflows which may occur up to
+/// once during a gen2 observing night
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct TimestampRange {
+    start: i64,
+    stop: i64,
+}
+
+impl TimestampRange {
+    fn new(start: i64, stop: i64) -> TimestampRange {
+        // Initilizing we truncate to 36 bits
+        // I just wanna do math on Z/nZ and not nearly blow my foot off
+        TimestampRange {
+            start: start.rem_euclid(0xf_ffff_ffff * 500 + 500),
+            stop: stop.rem_euclid(0xf_ffff_ffff * 500 + 500),
+        }
+    }
+
+    #[inline]
+    /// Check if a given timestamp is inside the range
+    fn inside(&self, timestamp: u64) -> bool {
+        // If the start of the range is larger than the stop we interpret that
+        // as meaning that the timestamp straddles a wrapping boundary
+        let timestamp = timestamp.rem_euclid(0xf_ffff_ffff * 500 + 500);
+        if self.start <= self.stop {
+            timestamp >= self.start as u64 && timestamp <= self.stop as u64
+        } else {
+            timestamp <= self.stop as u64 || timestamp >= self.start as u64
+        }
+    }
+
+    #[inline]
+    fn overlaps(&self, other: &TimestampRange) -> bool {
+        return self.inside(other.start as u64)
+            || self.inside(other.stop as u64)
+            || other.inside(self.start as u64)
+            || other.inside(self.stop as u64);
+    }
+
+    /// Grow the range by N ticks on either side
+    fn grow(&self, tolerance: i64) -> TimestampRange {
+        TimestampRange::new(self.start - tolerance, self.stop + tolerance)
     }
 }
 
@@ -62,6 +103,7 @@ enum BinneyError<T> {
     IOError(std::io::Error),
     ParseError(winnow::error::ErrMode<T>),
     PolarsError(PolarsError),
+    BinDirError(String),
 }
 
 impl<T> From<std::io::Error> for BinneyError<T> {
@@ -132,17 +174,16 @@ fn parse_data(input: &mut Stream<'_>) -> PResult<DataPacket> {
 #[inline]
 fn complete_packet(
     header: HeaderPacket,
-    storage: &mut Vec<Photon>,
+    storage: &mut Photons,
     input: &mut Stream<'_>,
 ) -> PResult<()> {
     while let Ok(packet) = parse_data.parse_next(input) {
-        storage.push(Photon {
-            x: packet.x,
-            y: packet.y,
-            timestamp: packet.timestamp as u64 + header.timestamp,
-            phase: packet.phase,
-            baseline: packet.baseline,
-        })
+        storage.xy.push(packet.x as u16 + (packet.y as u16) << 8);
+        storage
+            .timestamp
+            .push(packet.timestamp as u64 + header.timestamp * 500);
+        storage.phase.push(packet.phase);
+        storage.baseline.push(packet.baseline);
     }
     let _ = literal::<&[u8], Stream<'_>, ErrMode<ContextError>>(&[
         0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -151,32 +192,50 @@ fn complete_packet(
     Ok(())
 }
 
-fn parse_packet(storage: &mut Vec<Photon>, input: &mut Stream<'_>) -> PResult<HeaderPacket> {
+fn parse_packet(storage: &mut Photons, input: &mut Stream<'_>) -> PResult<HeaderPacket> {
     let header = parse_header.parse_next(input)?;
     complete_packet(header, storage, input)?;
     Ok(header)
 }
 
+/// Read from a file, potentially one that is still being written (or a pipe)
+/// and optionally one that does not start with a header by providing
+/// a header for photons that come before any header
 fn read_file(
-    filename: &str,
+    file: &mut File,
     header: Option<HeaderPacket>,
-) -> Result<(Vec<Photon>, HeaderPacket), BinneyError<ContextError>> {
+) -> Result<(Photons, HeaderPacket), BinneyError<ContextError>> {
+    // Read the full file into a buffer
     let mut buffer: Vec<u8> = vec![];
-    File::open(filename)?.read_to_end(&mut buffer)?;
+    file.read_to_end(&mut buffer)?;
     let mut buffer = stream(buffer.as_ref());
-    let mut storage = Vec::with_capacity(buffer.len() as usize / 8);
 
+    // Preallocate photon storage that is at least as large as the number of photons
+    // in the file
+    let mut storage = Photons::with_capacity(buffer.len() as usize / 8);
+
+    // If a header is provided attempt to read the first bytes in the file
+    // as if they are photons with the provided header
     if let Some(header) = header {
         complete_packet(header, &mut storage, &mut buffer)?;
     }
     if buffer.len() < 8 {
+        // If the file does not have more than 8 bytes left and we were
+        // provided a header than return any photons we may have read and
+        // the provided header
         if let Some(header) = header {
             return Ok((storage, header));
         }
+
+        // If not error out because there was never enough info to read
+        // anything, report how much more we would need
         Err(ErrMode::Incomplete(winnow::error::Needed::Size(
-            std::num::NonZero::new(8usize).unwrap(),
+            std::num::NonZero::new(8usize - buffer.len()).unwrap(),
         )))?;
     }
+
+    // Parse the first header in this file and its set of photon packets,
+    // then parse all the rest
     let mut header = parse_packet(&mut storage, &mut buffer)?;
     while buffer.len() >= 8 {
         header = parse_packet(&mut storage, &mut buffer)?;
@@ -184,40 +243,176 @@ fn read_file(
     Ok((storage, header))
 }
 
-fn to_parquet(
-    binfile: &str,
-    parquet: &str,
-    sorted: bool,
-) -> Result<HeaderPacket, BinneyError<ContextError>> {
+fn to_dataframe(
+    binfile: &mut File,
+) -> Result<(DataFrame, HeaderPacket), BinneyError<ContextError>> {
     let (photons, header) = read_file(binfile, None)?;
-    let xs = Series::new("x", photons.iter().map(|i| i.x).collect::<Vec<u8>>());
-    let ys = Series::new("y", photons.iter().map(|i| i.y).collect::<Vec<u8>>());
-    let ts = Series::new(
-        "timestamp",
-        photons.iter().map(|i| i.timestamp).collect::<Vec<u64>>(),
-    );
-    let ps = Series::new(
-        "phase",
-        photons.iter().map(|i| i.phase).collect::<Vec<i32>>(),
-    );
-    let bs = Series::new(
-        "baseline",
-        photons.iter().map(|i| i.baseline).collect::<Vec<i32>>(),
-    );
+    let xys = Series::new("xy", photons.xy);
+    let ts = Series::new("timestamp", photons.timestamp);
+    let ps = Series::new("phase", photons.phase);
+    let bs = Series::new("baseline", photons.baseline);
 
-    let mut df = DataFrame::new(vec![xs, ys, ts, ps, bs])?;
-    if sorted {
-        df = df.sort(["timestamp"], Default::default())?
-    }
+    Ok((DataFrame::new(vec![xys, ts, ps, bs])?, header))
+}
 
-    ParquetWriter::new(&mut std::fs::File::create(parquet)?).finish(&mut df)?;
+fn to_parquet(
+    binfile: &mut File,
+    parquet: &mut File,
+) -> Result<HeaderPacket, BinneyError<ContextError>> {
+    let (mut df, header) = to_dataframe(binfile)?;
+
+    df.sort_in_place(
+        ["timestamp"],
+        SortMultipleOptions::new().with_multithreaded(false),
+    )?;
+
+    ParquetWriter::new(parquet).finish(&mut df)?;
+    df.clear();
 
     Ok(header)
 }
 
+/// Top level structure for accessing packets in a binfile directory
+struct BinDirectory<'a> {
+    files: Vec<(File, TimestampRange)>,
+    parquet_dir: Option<(PathBuf, HashMap<(TimestampRange, usize), &'a File>)>,
+}
+
+impl<'a, 'b> BinDirectory<'a> {
+    fn new(
+        bindir: &'b std::path::Path,
+        parquet_dir: Option<&'b std::path::Path>,
+    ) -> Result<BinDirectory<'a>, BinneyError<ContextError>> {
+        if bindir.is_dir() {
+            let mut files = vec![];
+            let mut hbuf = [0; 8];
+            for file in std::fs::read_dir(bindir)? {
+                let path = file?.path();
+
+                // Look for files ending in .bin
+                if path.is_file() && path.extension().unwrap_or(std::ffi::OsStr::new("")) == "bin" {
+                    let meta = std::fs::metadata(&path)?;
+                    // Look for files that are non-empty files that are mmultiples of 8 bytes
+                    // TODO: Should we error if we find a .bin that is empty or not a multiple of 8?
+                    if meta.len() >= 8 && meta.len() % 8 == 0 {
+                        let mut f = File::open(path)?;
+
+                        // Parse the begining as a header to get the timestamp of the first packet
+                        // Note: We do not necessarily know that the first packet has the first
+                        //       timestamp in the file
+                        f.read_exact(&mut hbuf)?;
+                        f.rewind()?;
+                        let header = parse_header(&mut stream(&hbuf))?;
+                        files.push((f, header))
+                    }
+                }
+            }
+
+            // Find the packet with the highest timestamp
+            files.sort_by_key(|(_, h)| h.timestamp);
+            let lastheader = {
+                let lastfile = files.last_mut().ok_or(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "No binfiles found in directory",
+                ))?;
+
+                // For gen2 we know there should be a header every 102 packets or less, make room
+                // for 256 just in case
+                let mut lbuf = Vec::with_capacity(256 * 8);
+                if lastfile.0.seek(SeekFrom::End(0))? < 256 {
+                    lastfile.0.rewind()?;
+                    lastfile.0.read_to_end(&mut lbuf)?;
+                    lastfile.0.rewind()?;
+                } else {
+                    lastfile.0.seek(SeekFrom::End(-256 * 8))?;
+                    lastfile.0.read_to_end(&mut lbuf)?;
+                    lastfile.0.rewind()?;
+                }
+
+                // This is a semi recreational programming project so I reserve the right to use cursed syntax
+                let mut i = lbuf.len() - 8;
+                while match lbuf.get(i) {
+                    Some(0xff) => false,
+                    Some(_) => {
+                        i -= 8;
+                        true
+                    }
+                    None => {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "Binfile did not have a header packet before the end",
+                        ))?;
+                        true
+                    }
+                } {}
+
+                parse_header(&mut stream(&lbuf.as_slice()[i..i + 8]))?
+            };
+
+            let mut bd = BinDirectory {
+                // See above comment
+                //
+                // This could be written more clearly imperatively but I wanted to learn iterators better, so:
+                // - We can't clone a file so we use `std::Vec::into_iter` which consumes the vector giving us an owned
+                //   file in our iterator
+                // - We use rfold to go from the end back to the begining with an accumulator that has
+                //   a vector that we want to eventually return, and a timestamp that starts with the
+                //   last timestamp of the last file and ends up being the starting timestamp of each
+                //   which we use to build ranges
+                files: files
+                    .into_iter()
+                    .rfold((vec![], lastheader), |(mut v, h), (f, fh)| {
+                        v.push((
+                            f,
+                            TimestampRange::new(fh.timestamp as i64, h.timestamp as i64),
+                        ));
+                        (v, fh)
+                    })
+                    .0,
+                parquet_dir: parquet_dir.map_or(None, |p: &std::path::Path| {
+                    Some((PathBuf::from(p), HashMap::new()))
+                }),
+            };
+            bd.files.reverse();
+
+            Ok(bd)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "bindir and/or outdir is not a directory",
+            ))?
+        }
+    }
+
+    fn convert_all(&mut self) -> Result<(), BinneyError<ContextError>> {
+        let (path, cache) = self.parquet_dir.clone().ok_or(BinneyError::BinDirError(
+            "Parquet dir not specified, cannot convert use read family of functions instead".into(),
+        ))?;
+
+        // TODO: Error reporting from the closure without crashing
+        self.files
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, (f, t))| {
+                let ppath = path.join(format!("{}-{}-{}.parquet", t.start, t.stop, i));
+                let mut file = File::create(ppath).unwrap();
+                f.rewind().unwrap();
+                to_parquet(f, &mut file).unwrap();
+            });
+
+        Ok(())
+    }
+}
+
 fn main() -> Result<(), BinneyError<ContextError>> {
+    BinDirectory::new(
+        Path::new("../20201006/"),
+        Some(Path::new("../20201006-parquet")),
+    )?
+    .convert_all()?;
     Ok(())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,32 +432,28 @@ mod tests {
             0x18, 0xc2, 0xc4, 0x1e, 0xf5, 0x39, 0xef, 0x12,
             0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
         ]);
-        let mut storage = Vec::with_capacity(10);
+        let mut storage = Photons::with_capacity(0);
         parse_packet(&mut storage, &mut input).unwrap();
-        assert_eq!(storage, vec![]);
+        assert_eq!(storage, Photons::with_capacity(0));
         parse_packet(&mut storage, &mut input).unwrap();
         assert_eq!(
             storage,
-            vec![Photon {
-                x: 99,
-                y: 44,
-                timestamp: 131 + 48426527995,
-                phase: -34148,
-                baseline: -4334
-            }]
+            Photons {
+                xy: vec![99 + 44 << 8],
+                timestamp: vec![131 + 48426527995 * 500],
+                phase: vec![-34148],
+                baseline: vec![-4334]
+            }
         );
         parse_packet(&mut storage, &mut input).unwrap();
         assert_eq!(
             storage,
-            std::iter::repeat(Photon {
-                x: 99,
-                y: 44,
-                timestamp: 131 + 48426527995,
-                phase: -34148,
-                baseline: -4334
-            })
-            .take(5)
-            .collect::<Vec<_>>()
+            Photons {
+                xy: vec![99 + 44 << 8; 5],
+                timestamp: vec![131 + 48426527995 * 500; 5],
+                phase: vec![-34148; 5],
+                baseline: vec![-4334; 5]
+            }
         );
     }
 
@@ -295,5 +486,54 @@ mod tests {
         );
 
         assert_eq!(input_data, stream(&[]))
+    }
+
+    #[test]
+    fn test_ranges() {
+        let a = TimestampRange::new(0, 100);
+        let b = TimestampRange::new(99, 1000);
+        let c = TimestampRange::new(101, 102);
+        let d = TimestampRange::new(
+            0xf_ffff_ffff * 500 + 500 - 30,
+            0xf_ffff_ffff * 500 + 500 + 30,
+        );
+        let e = TimestampRange::new(100, 101);
+        let f = TimestampRange::new(-30, 30);
+
+        assert_eq!(d, f);
+
+        assert!(d.start > d.stop);
+        assert!(d.stop > 0);
+
+        assert!(a.overlaps(&b));
+        assert!(b.overlaps(&c));
+        assert!(!a.overlaps(&c));
+        assert!(d.overlaps(&a));
+        assert!(!d.overlaps(&b));
+        assert!(e.overlaps(&a));
+        assert!(e.overlaps(&b));
+        assert!(e.overlaps(&c));
+        assert!(!e.overlaps(&d));
+
+        assert!(b.overlaps(&a));
+        assert!(c.overlaps(&b));
+        assert!(!c.overlaps(&a));
+        assert!(a.overlaps(&d));
+        assert!(!b.overlaps(&d));
+        assert!(a.overlaps(&e));
+        assert!(b.overlaps(&e));
+        assert!(c.overlaps(&e));
+        assert!(!d.overlaps(&e));
+
+        assert!(a.inside(99));
+        assert!(a.inside(100));
+        assert!(!a.inside(101));
+        assert!(a.inside(0));
+        assert!(b.inside(99));
+        assert!(!b.inside(98));
+
+        assert!(d.inside(0xf_ffff_ffff * 500 + 500));
+        assert!(d.inside(0xf_ffff_ffff * 500 + 500 - 1));
+        assert!(d.inside(0xf_ffff_ffff * 500 + 500 + 1));
     }
 }
