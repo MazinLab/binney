@@ -1,7 +1,9 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use winnow::binary::bits::{bits, take};
 use winnow::error::{ContextError, ErrMode};
@@ -55,7 +57,7 @@ impl Photons {
 /// This is intentionally opaque to force you to use the provided methods for
 /// operations which correctly handle counter overflows which may occur up to
 /// once during a gen2 observing night
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct TimestampRange {
     start: i64,
     stop: i64,
@@ -178,7 +180,7 @@ fn complete_packet(
     input: &mut Stream<'_>,
 ) -> PResult<()> {
     while let Ok(packet) = parse_data.parse_next(input) {
-        storage.xy.push(packet.x as u16 + (packet.y as u16) << 8);
+        storage.xy.push(packet.x as u16 + ((packet.y as u16) << 8));
         storage
             .timestamp
             .push(packet.timestamp as u64 + header.timestamp * 500);
@@ -273,17 +275,26 @@ fn to_parquet(
 }
 
 /// Top level structure for accessing packets in a binfile directory
-struct BinDirectory<'a> {
-    files: Vec<(File, TimestampRange)>,
-    parquet_dir: Option<(PathBuf, HashMap<(TimestampRange, usize), &'a File>)>,
+struct BinDirectory {
+    files: Vec<(PathBuf, TimestampRange)>,
+    parquet_dir: (
+        PathBuf,
+        Arc<Mutex<HashMap<(TimestampRange, usize), PathBuf>>>,
+    ),
 }
 
-impl<'a, 'b> BinDirectory<'a> {
+impl BinDirectory {
+    /// We assume that the timestamps from consecutive binfiles overlap by no more than 10 ms
+    const OVERLAP_RANGE: i64 = 10000;
+
     fn new(
-        bindir: &'b std::path::Path,
-        parquet_dir: Option<&'b std::path::Path>,
-    ) -> Result<BinDirectory<'a>, BinneyError<ContextError>> {
-        if bindir.is_dir() {
+        bindir: &std::path::Path,
+        parquet_dir: &std::path::Path,
+    ) -> Result<BinDirectory, BinneyError<ContextError>> {
+        if bindir.is_dir() && !parquet_dir.is_file() {
+            if !parquet_dir.is_dir() {
+                std::fs::create_dir(parquet_dir)?
+            }
             let mut files = vec![];
             let mut hbuf = [0; 8];
             for file in std::fs::read_dir(bindir)? {
@@ -295,7 +306,7 @@ impl<'a, 'b> BinDirectory<'a> {
                     // Look for files that are non-empty files that are mmultiples of 8 bytes
                     // TODO: Should we error if we find a .bin that is empty or not a multiple of 8?
                     if meta.len() >= 8 && meta.len() % 8 == 0 {
-                        let mut f = File::open(path)?;
+                        let mut f = File::open(&path)?;
 
                         // Parse the begining as a header to get the timestamp of the first packet
                         // Note: We do not necessarily know that the first packet has the first
@@ -303,7 +314,7 @@ impl<'a, 'b> BinDirectory<'a> {
                         f.read_exact(&mut hbuf)?;
                         f.rewind()?;
                         let header = parse_header(&mut stream(&hbuf))?;
-                        files.push((f, header))
+                        files.push((path, header))
                     }
                 }
             }
@@ -311,10 +322,12 @@ impl<'a, 'b> BinDirectory<'a> {
             // Find the packet with the highest timestamp
             files.sort_by_key(|(_, h)| h.timestamp);
             let lastheader = {
-                let lastfile = files.last_mut().ok_or(std::io::Error::new(
+                let lastfile = files.last().ok_or(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "No binfiles found in directory",
                 ))?;
+
+                let mut lastfile = (File::open(&lastfile.0)?, lastfile.1);
 
                 // For gen2 we know there should be a header every 102 packets or less, make room
                 // for 256 just in case
@@ -369,9 +382,10 @@ impl<'a, 'b> BinDirectory<'a> {
                         (v, fh)
                     })
                     .0,
-                parquet_dir: parquet_dir.map_or(None, |p: &std::path::Path| {
-                    Some((PathBuf::from(p), HashMap::new()))
-                }),
+                parquet_dir: (
+                    PathBuf::from(parquet_dir),
+                    Arc::new(Mutex::new(HashMap::new())),
+                ),
             };
             bd.files.reverse();
 
@@ -379,37 +393,75 @@ impl<'a, 'b> BinDirectory<'a> {
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "bindir and/or outdir is not a directory",
+                "bindir and is not a directory",
             ))?
         }
     }
 
-    fn convert_all(&mut self) -> Result<(), BinneyError<ContextError>> {
-        let (path, cache) = self.parquet_dir.clone().ok_or(BinneyError::BinDirError(
-            "Parquet dir not specified, cannot convert use read family of functions instead".into(),
-        ))?;
+    fn convert_or_cached(
+        &self,
+        index: usize,
+        binpath: &PathBuf,
+        trange: TimestampRange,
+        overwrite: bool,
+    ) -> Result<(), BinneyError<ContextError>> {
+        let (path, cache) = &self.parquet_dir;
+        let ppath = path.join(format!(
+            "{}-{}-{}.parquet",
+            trange.start, trange.stop, index
+        ));
+        if ppath.is_file() && !overwrite && ppath.metadata()?.mtime() >= binpath.metadata()?.mtime()
+        {
+            return Ok(());
+        }
+        {
+            let cache = cache.lock().unwrap();
+            if cache.contains_key(&(trange, index)) {
+                return Ok(());
+            }
+        }
+        let mut file = File::create(&ppath)?;
+        to_parquet(&mut File::open(binpath).unwrap(), &mut file)?;
+        {
+            let mut cache = cache.lock().unwrap();
+            cache.insert((trange, index), ppath);
+        };
+        Ok(())
+    }
 
-        // TODO: Error reporting from the closure without crashing
+    fn convert_all(&self, overwrite: bool) -> Result<(), BinneyError<ContextError>> {
+        // TODO: Error reporting from the closure instead of crashing
         self.files
-            .par_iter_mut()
+            .par_iter()
             .enumerate()
-            .for_each(|(i, (f, t))| {
-                let ppath = path.join(format!("{}-{}-{}.parquet", t.start, t.stop, i));
-                let mut file = File::create(ppath).unwrap();
-                f.rewind().unwrap();
-                to_parquet(f, &mut file).unwrap();
-            });
+            .for_each(|(i, (bpath, t))| self.convert_or_cached(i, bpath, *t, overwrite).unwrap());
 
+        Ok(())
+    }
+
+    fn convert_timerange(
+        &self,
+        trange: TimestampRange,
+        overwrite: bool,
+    ) -> Result<(), BinneyError<ContextError>> {
+        self.files
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, (p, t))| {
+                if t.grow(BinDirectory::OVERLAP_RANGE).overlaps(&trange) {
+                    Some((i, p, t))
+                } else {
+                    None
+                }
+            })
+            .for_each(|(i, p, t)| self.convert_or_cached(i, p, *t, overwrite).unwrap());
         Ok(())
     }
 }
 
 fn main() -> Result<(), BinneyError<ContextError>> {
-    BinDirectory::new(
-        Path::new("../20201006/"),
-        Some(Path::new("../20201006-parquet")),
-    )?
-    .convert_all()?;
+    BinDirectory::new(Path::new("../20201006/"), Path::new("../20201006-parquet"))?
+        .convert_all(true)?;
     Ok(())
 }
 
