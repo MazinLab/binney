@@ -17,6 +17,8 @@ use polars::prelude::*;
 
 use rayon::prelude::*;
 
+use indicatif::ParallelProgressIterator;
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 struct HeaderPacket {
     board: u8,
@@ -33,11 +35,19 @@ struct DataPacket {
     baseline: i32,
 }
 
+/// A structure representing a column wise vector of photons
 #[derive(Debug, PartialEq)]
 struct Photons {
+    /// The REPORTED `(x, y)` array coordinates as `(x << 8) | y`
+    /// It is unlikely these are the true array coordinates this
+    /// is here purely for resonator tracking and is used to later
+    /// apply a beammap. This is also NOT the "Reasonator ID".
     xy: Vec<u16>,
+    /// The timestamp reported by the readout in microseconds.
     timestamp: Vec<u64>,
+    /// The phase reported by the readout in ?? units
     phase: Vec<i32>,
+    /// The baseline phase reported by the readout in ?? units
     baseline: Vec<i32>,
 }
 
@@ -64,6 +74,7 @@ struct TimestampRange {
 }
 
 impl TimestampRange {
+    const TICKS_PER_SEC: u64 = 1000 * 1000;
     fn new(start: i64, stop: i64) -> TimestampRange {
         // Initilizing we truncate to 36 bits
         // I just wanna do math on Z/nZ and not nearly blow my foot off
@@ -87,11 +98,12 @@ impl TimestampRange {
     }
 
     #[inline]
+    /// Check if another timestamp range overlaps with this one
     fn overlaps(&self, other: &TimestampRange) -> bool {
-        return self.inside(other.start as u64)
+        self.inside(other.start as u64)
             || self.inside(other.stop as u64)
             || other.inside(self.start as u64)
-            || other.inside(self.stop as u64);
+            || other.inside(self.stop as u64)
     }
 
     /// Grow the range by N ticks on either side
@@ -180,7 +192,7 @@ fn complete_packet(
     input: &mut Stream<'_>,
 ) -> PResult<()> {
     while let Ok(packet) = parse_data.parse_next(input) {
-        storage.xy.push(packet.x as u16 + ((packet.y as u16) << 8));
+        storage.xy.push(packet.y as u16 | ((packet.x as u16) << 8));
         storage
             .timestamp
             .push(packet.timestamp as u64 + header.timestamp * 500);
@@ -203,6 +215,8 @@ fn parse_packet(storage: &mut Photons, input: &mut Stream<'_>) -> PResult<Header
 /// Read from a file, potentially one that is still being written (or a pipe)
 /// and optionally one that does not start with a header by providing
 /// a header for photons that come before any header
+///
+/// Instead of using this directly you probably want `BinDirectory`
 fn read_file(
     file: &mut File,
     header: Option<HeaderPacket>,
@@ -281,15 +295,19 @@ struct BinDirectory {
         PathBuf,
         Arc<Mutex<HashMap<(TimestampRange, usize), PathBuf>>>,
     ),
+    progress: bool,
 }
 
 impl BinDirectory {
     /// We assume that the timestamps from consecutive binfiles overlap by no more than 10 ms
     const OVERLAP_RANGE: i64 = 10000;
 
+    /// Construct a new `BinDirectory` instance from a bindirectory and a parquet cache directory
+    /// Optionally enable a progressbar during conversions
     fn new(
         bindir: &std::path::Path,
         parquet_dir: &std::path::Path,
+        progress: bool,
     ) -> Result<BinDirectory, BinneyError<ContextError>> {
         if bindir.is_dir() && !parquet_dir.is_file() {
             if !parquet_dir.is_dir() {
@@ -386,6 +404,7 @@ impl BinDirectory {
                     PathBuf::from(parquet_dir),
                     Arc::new(Mutex::new(HashMap::new())),
                 ),
+                progress,
             };
             bd.files.reverse();
 
@@ -410,35 +429,65 @@ impl BinDirectory {
             "{}-{}-{}.parquet",
             trange.start, trange.stop, index
         ));
+
+        // Return immediately if the parquet file already exists and we don't need to update it
         if ppath.is_file() && !overwrite && ppath.metadata()?.mtime() >= binpath.metadata()?.mtime()
         {
             return Ok(());
         }
+
+        // Check the cache to see if we have already converted it
+        //
+        // NOTE: This check is only strictly necessary if this function is
+        //       being called by several different threads for the same file
+        //       hopefully avoiding TOCTOU nightmares and clobbering
         {
-            let cache = cache.lock().unwrap();
+            let mut cache = cache.lock().unwrap();
             if cache.contains_key(&(trange, index)) {
                 return Ok(());
             }
+            cache.insert((trange, index), ppath.clone());
         }
+
+        // Create and wite the file, and appropriately manage the cache and FS if this step fails.
         let mut file = File::create(&ppath)?;
-        to_parquet(&mut File::open(binpath).unwrap(), &mut file)?;
-        {
+        if let Err(e) = to_parquet(&mut File::open(binpath).unwrap(), &mut file) {
             let mut cache = cache.lock().unwrap();
-            cache.insert((trange, index), ppath);
-        };
+            cache.remove(&(trange, index));
+            std::fs::remove_file(ppath)?;
+            return Err(e);
+        }
         Ok(())
     }
 
+    /// Convert all bin files in the bin directory into parquet files
+    ///
+    /// If `overwrite` is set this will overwrite existing parquet files
+    /// otherwise it will only overwrite a parquet file if the corresponding
+    /// bin file has changed since the parquet file was last written
     fn convert_all(&self, overwrite: bool) -> Result<(), BinneyError<ContextError>> {
         // TODO: Error reporting from the closure instead of crashing
-        self.files
-            .par_iter()
-            .enumerate()
-            .for_each(|(i, (bpath, t))| self.convert_or_cached(i, bpath, *t, overwrite).unwrap());
+        if self.progress {
+            self.files
+                .par_iter()
+                .progress_count(self.files.len() as u64)
+                .enumerate()
+                .for_each(|(i, (bpath, t))| {
+                    self.convert_or_cached(i, bpath, *t, overwrite).unwrap()
+                });
+        } else {
+            self.files
+                .par_iter()
+                .enumerate()
+                .for_each(|(i, (bpath, t))| {
+                    self.convert_or_cached(i, bpath, *t, overwrite).unwrap()
+                });
+        }
 
         Ok(())
     }
 
+    /// Convert a `TimestampRange` length
     fn convert_timerange(
         &self,
         trange: TimestampRange,
@@ -459,9 +508,47 @@ impl BinDirectory {
     }
 }
 
+#[derive(clap::Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Suppress the progress bar and any logging
+    #[arg(long, short)]
+    quiet: bool,
+
+    /// Which subutility to use
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(clap::Subcommand)]
+enum Commands {
+    ConvertAll {
+        /// A directory containing some bin files
+        bin_dir: PathBuf,
+
+        /// The directory where parquet files will be written
+        parquet_dir: PathBuf,
+
+        /// Overwrite parquet files even if the bin file has not changed
+        /// since they were written
+        #[arg(long)]
+        overwrite: bool,
+    },
+}
+
 fn main() -> Result<(), BinneyError<ContextError>> {
-    BinDirectory::new(Path::new("../20201006/"), Path::new("../20201006-parquet"))?
-        .convert_all(true)?;
+    use clap::Parser;
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::ConvertAll {
+            bin_dir,
+            parquet_dir,
+            overwrite,
+        } => BinDirectory::new(&bin_dir, &parquet_dir, true)
+            .unwrap()
+            .convert_all(overwrite)
+            .unwrap(),
+    }
     Ok(())
 }
 

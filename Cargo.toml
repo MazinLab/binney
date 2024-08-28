@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-clap = "4.5.16"
+clap = { version = "4.5.16", features = ["derive"] }
 hashbrown = "0.14.5"
+indicatif = { version = "0.17.8", features = ["rayon"] }
 polars = { version = "0.42.0", features = ["ndarray", "bigidx", "performant", "lazy", "parquet", "ipc", "fmt", "streaming"] }
 rayon = "1.10.0"
 winnow = { version = "0.6.18", features = ["simd"] }
