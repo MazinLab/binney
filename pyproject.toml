@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0", "pip>=24.0"]
+build-backend = "maturin"
+
+[project]
+name = "binney"
+classifiers = [
+    "Programming Language :: Python",
+    "Programming Language :: Rust"
+]
+dynamic = ["version"]
+requires-python = ">=3.8"
+
+[project.scripts]
+binney-cli = "binney.cli:main"

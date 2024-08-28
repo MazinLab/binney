@@ -1,7 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -13,46 +12,51 @@ use winnow::Bytes;
 
 use hashbrown::HashMap;
 
+use indicatif::ParallelProgressIterator;
+
 use polars::prelude::*;
 
 use rayon::prelude::*;
 
-use indicatif::ParallelProgressIterator;
+use pyo3::{prelude::*, wrap_pymodule};
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-struct HeaderPacket {
-    board: u8,
-    frame: u16,
-    timestamp: u64,
+#[pyclass(frozen, eq, hash)]
+#[derive(Debug, PartialEq, Clone, Copy, Hash)]
+pub struct HeaderPacket {
+    pub board: u8,
+    pub frame: u16,
+    pub timestamp: u64,
 }
 
-#[derive(Debug, PartialEq)]
-struct DataPacket {
-    x: u8,
-    y: u8,
-    timestamp: u16,
-    phase: i32,
-    baseline: i32,
+#[pyclass(frozen, eq, hash)]
+#[derive(Debug, PartialEq, Hash)]
+pub struct DataPacket {
+    pub x: u8,
+    pub y: u8,
+    pub timestamp: u16,
+    pub phase: i32,
+    pub baseline: i32,
 }
 
 /// A structure representing a column wise vector of photons
+#[pyclass(frozen)]
 #[derive(Debug, PartialEq)]
-struct Photons {
+pub struct Photons {
     /// The REPORTED `(x, y)` array coordinates as `(x << 8) | y`
     /// It is unlikely these are the true array coordinates this
     /// is here purely for resonator tracking and is used to later
     /// apply a beammap. This is also NOT the "Reasonator ID".
-    xy: Vec<u16>,
+    pub xy: Vec<u16>,
     /// The timestamp reported by the readout in microseconds.
-    timestamp: Vec<u64>,
+    pub timestamp: Vec<u64>,
     /// The phase reported by the readout in ?? units
-    phase: Vec<i32>,
+    pub phase: Vec<i32>,
     /// The baseline phase reported by the readout in ?? units
-    baseline: Vec<i32>,
+    pub baseline: Vec<i32>,
 }
 
 impl Photons {
-    fn with_capacity(capacity: usize) -> Photons {
+    pub fn with_capacity(capacity: usize) -> Photons {
         Photons {
             xy: Vec::with_capacity(capacity),
             timestamp: Vec::with_capacity(capacity),
@@ -67,15 +71,18 @@ impl Photons {
 /// This is intentionally opaque to force you to use the provided methods for
 /// operations which correctly handle counter overflows which may occur up to
 /// once during a gen2 observing night
+#[pyclass(frozen, eq, hash)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-struct TimestampRange {
+pub struct TimestampRange {
     start: i64,
     stop: i64,
 }
 
+#[pymethods]
 impl TimestampRange {
-    const TICKS_PER_SEC: u64 = 1000 * 1000;
-    fn new(start: i64, stop: i64) -> TimestampRange {
+    pub const TICKS_PER_SEC: u64 = 1000 * 1000;
+    #[new]
+    pub fn new(start: i64, stop: i64) -> TimestampRange {
         // Initilizing we truncate to 36 bits
         // I just wanna do math on Z/nZ and not nearly blow my foot off
         TimestampRange {
@@ -86,7 +93,7 @@ impl TimestampRange {
 
     #[inline]
     /// Check if a given timestamp is inside the range
-    fn inside(&self, timestamp: u64) -> bool {
+    pub fn inside(&self, timestamp: u64) -> bool {
         // If the start of the range is larger than the stop we interpret that
         // as meaning that the timestamp straddles a wrapping boundary
         let timestamp = timestamp.rem_euclid(0xf_ffff_ffff * 500 + 500);
@@ -99,7 +106,7 @@ impl TimestampRange {
 
     #[inline]
     /// Check if another timestamp range overlaps with this one
-    fn overlaps(&self, other: &TimestampRange) -> bool {
+    pub fn overlaps(&self, other: &TimestampRange) -> bool {
         self.inside(other.start as u64)
             || self.inside(other.stop as u64)
             || other.inside(self.start as u64)
@@ -107,33 +114,48 @@ impl TimestampRange {
     }
 
     /// Grow the range by N ticks on either side
-    fn grow(&self, tolerance: i64) -> TimestampRange {
+    pub fn grow(&self, tolerance: i64) -> TimestampRange {
         TimestampRange::new(self.start - tolerance, self.stop + tolerance)
     }
 }
 
 #[derive(Debug)]
-enum BinneyError<T> {
+pub enum BinneyError {
     IOError(std::io::Error),
-    ParseError(winnow::error::ErrMode<T>),
+    ParseError(winnow::error::ErrMode<ContextError>),
     PolarsError(PolarsError),
     BinDirError(String),
 }
 
-impl<T> From<std::io::Error> for BinneyError<T> {
-    fn from(error: std::io::Error) -> BinneyError<T> {
+impl From<BinneyError> for PyErr {
+    fn from(error: BinneyError) -> Self {
+        match error {
+            BinneyError::IOError(e) => e.into(),
+            BinneyError::ParseError(e) => {
+                pyo3::exceptions::PyBufferError::new_err(format!("BinParsingError: {}", e))
+            }
+            BinneyError::PolarsError(e) => {
+                pyo3::exceptions::PyException::new_err(format!("PolarsError: {}", e))
+            }
+            BinneyError::BinDirError(e) => pyo3::exceptions::PyIOError::new_err(e),
+        }
+    }
+}
+
+impl From<std::io::Error> for BinneyError {
+    fn from(error: std::io::Error) -> BinneyError {
         BinneyError::IOError(error)
     }
 }
 
-impl<T> From<winnow::error::ErrMode<T>> for BinneyError<T> {
-    fn from(error: winnow::error::ErrMode<T>) -> BinneyError<T> {
+impl From<winnow::error::ErrMode<ContextError>> for BinneyError {
+    fn from(error: winnow::error::ErrMode<ContextError>) -> BinneyError {
         BinneyError::ParseError(error)
     }
 }
 
-impl<T> From<PolarsError> for BinneyError<T> {
-    fn from(error: PolarsError) -> BinneyError<T> {
+impl From<PolarsError> for BinneyError {
+    fn from(error: PolarsError) -> BinneyError {
         BinneyError::PolarsError(error)
     }
 }
@@ -217,10 +239,10 @@ fn parse_packet(storage: &mut Photons, input: &mut Stream<'_>) -> PResult<Header
 /// a header for photons that come before any header
 ///
 /// Instead of using this directly you probably want `BinDirectory`
-fn read_file(
+pub fn read_file(
     file: &mut File,
     header: Option<HeaderPacket>,
-) -> Result<(Photons, HeaderPacket), BinneyError<ContextError>> {
+) -> Result<(Photons, HeaderPacket), BinneyError> {
     // Read the full file into a buffer
     let mut buffer: Vec<u8> = vec![];
     file.read_to_end(&mut buffer)?;
@@ -259,9 +281,7 @@ fn read_file(
     Ok((storage, header))
 }
 
-fn to_dataframe(
-    binfile: &mut File,
-) -> Result<(DataFrame, HeaderPacket), BinneyError<ContextError>> {
+fn to_dataframe(binfile: &mut File) -> Result<(DataFrame, HeaderPacket), BinneyError> {
     let (photons, header) = read_file(binfile, None)?;
     let xys = Series::new("xy", photons.xy);
     let ts = Series::new("timestamp", photons.timestamp);
@@ -271,10 +291,7 @@ fn to_dataframe(
     Ok((DataFrame::new(vec![xys, ts, ps, bs])?, header))
 }
 
-fn to_parquet(
-    binfile: &mut File,
-    parquet: &mut File,
-) -> Result<HeaderPacket, BinneyError<ContextError>> {
+pub fn to_parquet(binfile: &mut File, parquet: &mut File) -> Result<HeaderPacket, BinneyError> {
     let (mut df, header) = to_dataframe(binfile)?;
 
     df.sort_in_place(
@@ -289,7 +306,8 @@ fn to_parquet(
 }
 
 /// Top level structure for accessing packets in a binfile directory
-struct BinDirectory {
+#[pyclass(frozen)]
+pub struct BinDirectory {
     files: Vec<(PathBuf, TimestampRange)>,
     parquet_dir: (
         PathBuf,
@@ -299,19 +317,66 @@ struct BinDirectory {
 }
 
 impl BinDirectory {
+    fn convert_or_cached(
+        &self,
+        index: usize,
+        binpath: &PathBuf,
+        trange: TimestampRange,
+        overwrite: bool,
+    ) -> Result<(), BinneyError> {
+        let (path, cache) = &self.parquet_dir;
+        let ppath = path.join(format!(
+            "{}-{}-{}.parquet",
+            trange.start, trange.stop, index
+        ));
+
+        // Return immediately if the parquet file already exists and we don't need to update it
+        if ppath.is_file() && !overwrite && ppath.metadata()?.mtime() >= binpath.metadata()?.mtime()
+        {
+            return Ok(());
+        }
+
+        // Check the cache to see if we have already converted it
+        //
+        // NOTE: This check is only strictly necessary if this function is
+        //       being called by several different threads for the same file
+        //       hopefully avoiding TOCTOU nightmares and clobbering
+        {
+            let mut cache = cache.lock().unwrap();
+            if cache.contains_key(&(trange, index)) {
+                return Ok(());
+            }
+            cache.insert((trange, index), ppath.clone());
+        }
+
+        // Create and wite the file, and appropriately manage the cache and FS if this step fails.
+        let mut file = File::create(&ppath)?;
+        if let Err(e) = to_parquet(&mut File::open(binpath).unwrap(), &mut file) {
+            let mut cache = cache.lock().unwrap();
+            cache.remove(&(trange, index));
+            std::fs::remove_file(ppath)?;
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl BinDirectory {
     /// We assume that the timestamps from consecutive binfiles overlap by no more than 10 ms
-    const OVERLAP_RANGE: i64 = 10000;
+    pub const OVERLAP_RANGE: i64 = 10000;
 
     /// Construct a new `BinDirectory` instance from a bindirectory and a parquet cache directory
     /// Optionally enable a progressbar during conversions
-    fn new(
-        bindir: &std::path::Path,
-        parquet_dir: &std::path::Path,
+    #[new]
+    pub fn new(
+        bindir: std::path::PathBuf,
+        parquet_dir: std::path::PathBuf,
         progress: bool,
-    ) -> Result<BinDirectory, BinneyError<ContextError>> {
+    ) -> Result<BinDirectory, BinneyError> {
         if bindir.is_dir() && !parquet_dir.is_file() {
             if !parquet_dir.is_dir() {
-                std::fs::create_dir(parquet_dir)?
+                std::fs::create_dir(&parquet_dir)?
             }
             let mut files = vec![];
             let mut hbuf = [0; 8];
@@ -417,55 +482,12 @@ impl BinDirectory {
         }
     }
 
-    fn convert_or_cached(
-        &self,
-        index: usize,
-        binpath: &PathBuf,
-        trange: TimestampRange,
-        overwrite: bool,
-    ) -> Result<(), BinneyError<ContextError>> {
-        let (path, cache) = &self.parquet_dir;
-        let ppath = path.join(format!(
-            "{}-{}-{}.parquet",
-            trange.start, trange.stop, index
-        ));
-
-        // Return immediately if the parquet file already exists and we don't need to update it
-        if ppath.is_file() && !overwrite && ppath.metadata()?.mtime() >= binpath.metadata()?.mtime()
-        {
-            return Ok(());
-        }
-
-        // Check the cache to see if we have already converted it
-        //
-        // NOTE: This check is only strictly necessary if this function is
-        //       being called by several different threads for the same file
-        //       hopefully avoiding TOCTOU nightmares and clobbering
-        {
-            let mut cache = cache.lock().unwrap();
-            if cache.contains_key(&(trange, index)) {
-                return Ok(());
-            }
-            cache.insert((trange, index), ppath.clone());
-        }
-
-        // Create and wite the file, and appropriately manage the cache and FS if this step fails.
-        let mut file = File::create(&ppath)?;
-        if let Err(e) = to_parquet(&mut File::open(binpath).unwrap(), &mut file) {
-            let mut cache = cache.lock().unwrap();
-            cache.remove(&(trange, index));
-            std::fs::remove_file(ppath)?;
-            return Err(e);
-        }
-        Ok(())
-    }
-
     /// Convert all bin files in the bin directory into parquet files
     ///
     /// If `overwrite` is set this will overwrite existing parquet files
     /// otherwise it will only overwrite a parquet file if the corresponding
     /// bin file has changed since the parquet file was last written
-    fn convert_all(&self, overwrite: bool) -> Result<(), BinneyError<ContextError>> {
+    pub fn convert_all(&self, overwrite: bool) -> Result<(), BinneyError> {
         // TODO: Error reporting from the closure instead of crashing
         if self.progress {
             self.files
@@ -488,11 +510,11 @@ impl BinDirectory {
     }
 
     /// Convert a `TimestampRange` length
-    fn convert_timerange(
+    pub fn convert_timerange(
         &self,
         trange: TimestampRange,
         overwrite: bool,
-    ) -> Result<(), BinneyError<ContextError>> {
+    ) -> Result<(), BinneyError> {
         self.files
             .par_iter()
             .enumerate()
@@ -508,48 +530,87 @@ impl BinDirectory {
     }
 }
 
-#[derive(clap::Parser)]
-#[command(version, about)]
-struct Cli {
-    /// Suppress the progress bar and any logging
-    #[arg(long, short)]
-    quiet: bool,
+#[pymodule]
+fn binney(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<BinDirectory>()?;
+    m.add_class::<TimestampRange>()?;
+    m.add_class::<HeaderPacket>()?;
+    m.add_class::<DataPacket>()?;
+    m.add_class::<Photons>()?;
 
-    /// Which subutility to use
-    #[command(subcommand)]
-    command: Commands,
-}
+    m.add_wrapped(wrap_pymodule!(cli))?;
 
-#[derive(clap::Subcommand)]
-enum Commands {
-    ConvertAll {
-        /// A directory containing some bin files
-        bin_dir: PathBuf,
-
-        /// The directory where parquet files will be written
-        parquet_dir: PathBuf,
-
-        /// Overwrite parquet files even if the bin file has not changed
-        /// since they were written
-        #[arg(long)]
-        overwrite: bool,
-    },
-}
-
-fn main() -> Result<(), BinneyError<ContextError>> {
-    use clap::Parser;
-    let cli = Cli::parse();
-    match cli.command {
-        Commands::ConvertAll {
-            bin_dir,
-            parquet_dir,
-            overwrite,
-        } => BinDirectory::new(&bin_dir, &parquet_dir, true)
-            .unwrap()
-            .convert_all(overwrite)
-            .unwrap(),
-    }
     Ok(())
+}
+
+#[pymodule]
+mod cli {
+    use super::*;
+    #[derive(clap::Parser)]
+    #[command(version, about)]
+    struct Cli {
+        /// Suppress the progress bar and any logging
+        #[arg(long, short)]
+        quiet: bool,
+
+        /// Which subutility to use
+        #[command(subcommand)]
+        command: Commands,
+    }
+
+    #[derive(clap::Subcommand)]
+    enum Commands {
+        ConvertAll {
+            /// A directory containing some bin files
+            bin_dir: PathBuf,
+
+            /// The directory where parquet files will be written
+            parquet_dir: PathBuf,
+
+            /// Overwrite parquet files even if the bin file has not changed
+            /// since they were written
+            #[arg(long)]
+            overwrite: bool,
+        },
+    }
+
+    /// Run the command line program
+    #[pyfunction]
+    pub fn main(py: Python) -> Result<(), BinneyError> {
+        use clap::Parser;
+
+        let argv = py
+            .import_bound("sys")
+            .unwrap()
+            .getattr("argv")
+            .unwrap()
+            .extract::<Vec<String>>()
+            .unwrap();
+
+        let cli = Cli::parse_from(argv.into_iter());
+
+        match cli.command {
+            Commands::ConvertAll {
+                bin_dir,
+                parquet_dir,
+                overwrite,
+            } => BinDirectory::new(bin_dir, parquet_dir, true)
+                .unwrap()
+                .convert_all(overwrite)
+                .unwrap(),
+        }
+        Ok(())
+    }
+
+    /// Hack: workaround for https://github.com/PyO3/pyo3/issues/759
+    #[pymodule_init]
+    fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        Python::with_gil(|py| {
+            py.import_bound("sys")?
+                .getattr("modules")?
+                .set_item("binney.cli", m)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -578,7 +639,7 @@ mod tests {
         assert_eq!(
             storage,
             Photons {
-                xy: vec![99 + 44 << 8],
+                xy: vec![(99 << 8) + 44],
                 timestamp: vec![131 + 48426527995 * 500],
                 phase: vec![-34148],
                 baseline: vec![-4334]
@@ -588,7 +649,7 @@ mod tests {
         assert_eq!(
             storage,
             Photons {
-                xy: vec![99 + 44 << 8; 5],
+                xy: vec![(99 << 8) + 44; 5],
                 timestamp: vec![131 + 48426527995 * 500; 5],
                 phase: vec![-34148; 5],
                 baseline: vec![-4334; 5]
