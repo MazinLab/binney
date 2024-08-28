@@ -295,7 +295,7 @@ pub fn to_parquet(binfile: &mut File, parquet: &mut File) -> Result<HeaderPacket
     let (mut df, header) = to_dataframe(binfile)?;
 
     df.sort_in_place(
-        ["timestamp"],
+        ["xy", "timestamp"],
         SortMultipleOptions::new().with_multithreaded(false),
     )?;
 
