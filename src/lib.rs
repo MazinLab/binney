@@ -20,105 +20,6 @@ use rayon::prelude::*;
 
 use pyo3::{prelude::*, wrap_pymodule};
 
-#[pyclass(frozen, eq, hash)]
-#[derive(Debug, PartialEq, Clone, Copy, Hash)]
-pub struct HeaderPacket {
-    pub board: u8,
-    pub frame: u16,
-    pub timestamp: u64,
-}
-
-#[pyclass(frozen, eq, hash)]
-#[derive(Debug, PartialEq, Hash)]
-pub struct DataPacket {
-    pub x: u8,
-    pub y: u8,
-    pub timestamp: u16,
-    pub phase: i32,
-    pub baseline: i32,
-}
-
-/// A structure representing a column wise vector of photons
-#[pyclass(frozen)]
-#[derive(Debug, PartialEq)]
-pub struct Photons {
-    /// The REPORTED `(x, y)` array coordinates as `(x << 8) | y`
-    /// It is unlikely these are the true array coordinates this
-    /// is here purely for resonator tracking and is used to later
-    /// apply a beammap. This is also NOT the "Reasonator ID".
-    pub xy: Vec<u16>,
-    /// The timestamp reported by the readout in microseconds.
-    pub timestamp: Vec<u64>,
-    /// The phase reported by the readout in ?? units
-    pub phase: Vec<i32>,
-    /// The baseline phase reported by the readout in ?? units
-    pub baseline: Vec<i32>,
-}
-
-impl Photons {
-    pub fn with_capacity(capacity: usize) -> Photons {
-        Photons {
-            xy: Vec::with_capacity(capacity),
-            timestamp: Vec::with_capacity(capacity),
-            phase: Vec::with_capacity(capacity),
-            baseline: Vec::with_capacity(capacity),
-        }
-    }
-}
-
-/// Represents a range of us gen2 timestamps
-///
-/// This is intentionally opaque to force you to use the provided methods for
-/// operations which correctly handle counter overflows which may occur up to
-/// once during a gen2 observing night
-#[pyclass(frozen, eq, hash)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TimestampRange {
-    start: i64,
-    stop: i64,
-}
-
-#[pymethods]
-impl TimestampRange {
-    pub const TICKS_PER_SEC: u64 = 1000 * 1000;
-    #[new]
-    pub fn new(start: i64, stop: i64) -> TimestampRange {
-        // Initilizing we truncate to 36 bits
-        // I just wanna do math on Z/nZ and not nearly blow my foot off
-        TimestampRange {
-            start: start.rem_euclid(0xf_ffff_ffff * 500 + 500),
-            stop: stop.rem_euclid(0xf_ffff_ffff * 500 + 500),
-        }
-    }
-
-    #[inline]
-    /// Check if a given timestamp is inside the range
-    pub fn inside(&self, timestamp: u64) -> bool {
-        // If the start of the range is larger than the stop we interpret that
-        // as meaning that the timestamp straddles a wrapping boundary
-        let timestamp = timestamp.rem_euclid(0xf_ffff_ffff * 500 + 500);
-        if self.start <= self.stop {
-            timestamp >= self.start as u64 && timestamp <= self.stop as u64
-        } else {
-            timestamp <= self.stop as u64 || timestamp >= self.start as u64
-        }
-    }
-
-    #[inline]
-    /// Check if another timestamp range overlaps with this one
-    pub fn overlaps(&self, other: &TimestampRange) -> bool {
-        self.inside(other.start as u64)
-            || self.inside(other.stop as u64)
-            || other.inside(self.start as u64)
-            || other.inside(self.stop as u64)
-    }
-
-    /// Grow the range by N ticks on either side
-    pub fn grow(&self, tolerance: i64) -> TimestampRange {
-        TimestampRange::new(self.start - tolerance, self.stop + tolerance)
-    }
-}
-
 #[derive(Debug)]
 pub enum BinneyError {
     IOError(std::io::Error),
@@ -157,6 +58,189 @@ impl From<winnow::error::ErrMode<ContextError>> for BinneyError {
 impl From<PolarsError> for BinneyError {
     fn from(error: PolarsError) -> BinneyError {
         BinneyError::PolarsError(error)
+    }
+}
+
+/// A structure representing a column wise vector of photons
+#[pyclass(frozen)]
+#[derive(Debug, PartialEq)]
+pub struct Photons {
+    /// The REPORTED `(x, y)` array coordinates as `(x << 8) | y`
+    /// It is unlikely these are the true array coordinates this
+    /// is here purely for resonator tracking and is used to later
+    /// apply a beammap. This is also NOT the "Reasonator ID".
+    pub xy: Vec<u16>,
+    /// The timestamp reported by the readout in microseconds.
+    pub timestamp: Vec<u64>,
+    /// The phase reported by the readout in ?? units
+    pub phase: Vec<i32>,
+    /// The baseline phase reported by the readout in ?? units
+    pub baseline: Vec<i32>,
+}
+
+impl Photons {
+    pub fn with_capacity(capacity: usize) -> Photons {
+        Photons {
+            xy: Vec::with_capacity(capacity),
+            timestamp: Vec::with_capacity(capacity),
+            phase: Vec::with_capacity(capacity),
+            baseline: Vec::with_capacity(capacity),
+        }
+    }
+}
+
+/// Represents a range of us gen2 timestamps
+///
+/// This is intentionally opaque to force you to use the provided methods for
+/// operations which correctly handle counter overflows which may occur up to
+/// once during a gen2 observing night. Both sides of the range are inclusive
+///
+/// ### Usage
+///
+/// ```python
+/// timerange = binney.TimestampRange(10, 100)
+/// assert(timerange.inside(50))
+/// other = binney.TimestampRange(100, 500)
+/// assert(other.overlaps(timerange))
+/// ```
+///
+/// ### Parameters
+/// - `start: int` The start time for this timerange in ticks
+/// - `stop: int` The stop time for this timerange in ticks
+#[pyclass(frozen, eq, hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TimestampRange {
+    start: i64,
+    stop: i64,
+}
+
+#[pymethods]
+impl TimestampRange {
+    /// The number of gen2 ticks in a second (ticks are 1us)
+    pub const TICKS_PER_SEC: u64 = 1000 * 1000;
+
+    /// Create a new timestamp range from a start and stop time in ticks, these
+    /// will be wrapped appropriately according to how the readout nominally
+    /// wraps timestamps
+    #[new]
+    pub fn new(start: i64, stop: i64) -> TimestampRange {
+        // Initilizing we truncate to 36 bits
+        // I just wanna do math on Z/nZ and not nearly blow my foot off
+        TimestampRange {
+            start: start.rem_euclid(0xf_ffff_ffff * 500 + 500),
+            stop: stop.rem_euclid(0xf_ffff_ffff * 500 + 500),
+        }
+    }
+
+    /// Check if a given timestamp is inside the range
+    #[inline]
+    pub fn inside(&self, timestamp: u64) -> bool {
+        // If the start of the range is larger than the stop we interpret that
+        // as meaning that the timestamp straddles a wrapping boundary
+        let timestamp = timestamp.rem_euclid(0xf_ffff_ffff * 500 + 500);
+        if self.start <= self.stop {
+            timestamp >= self.start as u64 && timestamp <= self.stop as u64
+        } else {
+            timestamp <= self.stop as u64 || timestamp >= self.start as u64
+        }
+    }
+
+    /// Check if another timestamp range overlaps with this one
+    #[inline]
+    pub fn overlaps(&self, other: &TimestampRange) -> bool {
+        self.inside(other.start as u64)
+            || self.inside(other.stop as u64)
+            || other.inside(self.start as u64)
+            || other.inside(self.stop as u64)
+    }
+
+    /// Grow the range by `tolerance` ticks on either side, can be negative to
+    /// shrink a range. This returns a new timestamp range instead of mutating
+    /// the current one.
+    pub fn grow(&self, tolerance: i64) -> TimestampRange {
+        TimestampRange::new(self.start - tolerance, self.stop + tolerance)
+    }
+}
+
+trait SerializePacket {
+    fn serialize(&self) -> [u8; 8];
+
+    fn serialize_into(&self, vec: &mut Vec<u8>) {
+        let bytes = self.serialize();
+        for byte in bytes.into_iter() {
+            vec.push(byte)
+        }
+    }
+}
+
+#[pyclass(frozen, eq, hash)]
+#[derive(Debug, PartialEq, Clone, Copy, Hash)]
+pub struct HeaderPacket {
+    pub board: u8,
+    pub frame: u16,
+    pub timestamp: u64,
+}
+
+impl SerializePacket for HeaderPacket {
+    fn serialize(&self) -> [u8; 8] {
+        let mut packet = 0xff00_0000_0000_0000u64;
+        packet |= (self.board as u64).wrapping_shl(64 - 8 - 8);
+        packet |= (self.frame as u64).wrapping_shl(64 - 8 - 8 - 8);
+        packet |= self.timestamp & 0x0000_00ff_ffff_ffff;
+
+        packet.to_be_bytes()
+    }
+}
+
+#[pyclass(frozen, eq, hash)]
+#[derive(Debug, PartialEq, Hash, Clone, Copy)]
+pub struct DataPacket {
+    pub x: u8,
+    pub y: u8,
+    pub timestamp: u16,
+    pub phase: i32,
+    pub baseline: i32,
+}
+
+impl SerializePacket for DataPacket {
+    fn serialize(&self) -> [u8; 8] {
+        let mut packet = 0xff00_0000_0000_0000u64;
+        packet |= (self.x as u64).wrapping_shl(64 - 10);
+        packet |= (self.y as u64).wrapping_shl(64 - 10 - 10);
+        packet |= (self.timestamp as u64 & 0x1ff).wrapping_shl(64 - 10 - 10 - 9);
+        packet |= (self.phase as u64 & 0x1ff).wrapping_shl(64 - 10 - 10 - 9);
+        packet |= (self.phase as u64 & 0x3ffff).wrapping_shl(64 - 10 - 10 - 9 - 18);
+        packet |= (self.phase as u64 & 0x1ffff).wrapping_shl(64 - 10 - 10 - 9 - 18 - 17);
+
+        packet.to_be_bytes()
+    }
+}
+
+#[pyclass(frozen, eq, hash)]
+#[derive(Debug, PartialEq, Hash, Clone, Copy)]
+pub struct PaddingPacket;
+
+impl SerializePacket for PaddingPacket {
+    fn serialize(&self) -> [u8; 8] {
+        0x7fff_ffff_ffff_ffffu64.to_be_bytes()
+    }
+}
+
+#[pyclass(frozen, eq, hash)]
+#[derive(Debug, PartialEq, Hash)]
+enum BinPacket {
+    Header(HeaderPacket),
+    Data(DataPacket),
+    Padding(PaddingPacket),
+}
+
+impl SerializePacket for BinPacket {
+    fn serialize(&self) -> [u8; 8] {
+        match self {
+            Self::Header(h) => h.serialize(),
+            Self::Data(h) => h.serialize(),
+            Self::Padding(h) => h.serialize(),
+        }
     }
 }
 
@@ -306,7 +390,7 @@ pub fn to_parquet(binfile: &mut File, parquet: &mut File) -> Result<HeaderPacket
 }
 
 /// Top level structure for accessing packets in a binfile directory
-#[pyclass(frozen)]
+#[pyclass(frozen, subclass)]
 pub struct BinDirectory {
     files: Vec<(PathBuf, TimestampRange)>,
     parquet_dir: (
@@ -323,7 +407,7 @@ impl BinDirectory {
         binpath: &PathBuf,
         trange: TimestampRange,
         overwrite: bool,
-    ) -> Result<(), BinneyError> {
+    ) -> Result<PathBuf, BinneyError> {
         let (path, cache) = &self.parquet_dir;
         let ppath = path.join(format!(
             "{}-{}-{}.parquet",
@@ -333,31 +417,32 @@ impl BinDirectory {
         // Return immediately if the parquet file already exists and we don't need to update it
         if ppath.is_file() && !overwrite && ppath.metadata()?.mtime() >= binpath.metadata()?.mtime()
         {
-            return Ok(());
+            return Ok(ppath);
         }
 
         // Check the cache to see if we have already converted it
         //
         // NOTE: This check is only strictly necessary if this function is
         //       being called by several different threads for the same file
-        //       hopefully avoiding TOCTOU nightmares and clobbering
+        //       implements a per file lock, hopefully avoiding TOCTOU
+        //       nightmares and clobbering
         {
             let mut cache = cache.lock().unwrap();
             if cache.contains_key(&(trange, index)) {
-                return Ok(());
+                return Ok(ppath);
             }
             cache.insert((trange, index), ppath.clone());
         }
 
         // Create and wite the file, and appropriately manage the cache and FS if this step fails.
         let mut file = File::create(&ppath)?;
-        if let Err(e) = to_parquet(&mut File::open(binpath).unwrap(), &mut file) {
+        if let Err(e) = to_parquet(&mut File::open(binpath)?, &mut file) {
             let mut cache = cache.lock().unwrap();
             cache.remove(&(trange, index));
             std::fs::remove_file(ppath)?;
             return Err(e);
         }
-        Ok(())
+        Ok(ppath)
     }
 }
 
@@ -380,6 +465,8 @@ impl BinDirectory {
             }
             let mut files = vec![];
             let mut hbuf = [0; 8];
+
+            // TODO: This is not fast as it could be in theory, maybe parallelize the for
             for file in std::fs::read_dir(bindir)? {
                 let path = file?.path();
 
@@ -436,7 +523,7 @@ impl BinDirectory {
                     None => {
                         Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
-                            "Binfile did not have a header packet before the end",
+                            "Binfile did not have a header packet before the end :( RIP",
                         ))?;
                         true
                     }
@@ -449,7 +536,7 @@ impl BinDirectory {
                 // See above comment
                 //
                 // This could be written more clearly imperatively but I wanted to learn iterators better, so:
-                // - We can't clone a file so we use `std::Vec::into_iter` which consumes the vector giving us an owned
+                // - We can't clone a path so we use `std::Vec::into_iter` which consumes the vector giving us an owned
                 //   file in our iterator
                 // - We use rfold to go from the end back to the begining with an accumulator that has
                 //   a vector that we want to eventually return, and a timestamp that starts with the
@@ -487,26 +574,21 @@ impl BinDirectory {
     /// If `overwrite` is set this will overwrite existing parquet files
     /// otherwise it will only overwrite a parquet file if the corresponding
     /// bin file has changed since the parquet file was last written
-    pub fn convert_all(&self, overwrite: bool) -> Result<(), BinneyError> {
-        // TODO: Error reporting from the closure instead of crashing
+    pub fn convert_all(&self, overwrite: bool) -> Result<Vec<PathBuf>, BinneyError> {
         if self.progress {
             self.files
                 .par_iter()
                 .progress_count(self.files.len() as u64)
                 .enumerate()
-                .for_each(|(i, (bpath, t))| {
-                    self.convert_or_cached(i, bpath, *t, overwrite).unwrap()
-                });
+                .map(|(i, (bpath, t))| self.convert_or_cached(i, bpath, *t, overwrite))
+                .collect()
         } else {
             self.files
                 .par_iter()
                 .enumerate()
-                .for_each(|(i, (bpath, t))| {
-                    self.convert_or_cached(i, bpath, *t, overwrite).unwrap()
-                });
+                .map(|(i, (bpath, t))| self.convert_or_cached(i, bpath, *t, overwrite))
+                .collect()
         }
-
-        Ok(())
     }
 
     /// Convert a `TimestampRange` length
@@ -514,7 +596,7 @@ impl BinDirectory {
         &self,
         trange: TimestampRange,
         overwrite: bool,
-    ) -> Result<(), BinneyError> {
+    ) -> Result<Vec<PathBuf>, BinneyError> {
         self.files
             .par_iter()
             .enumerate()
@@ -525,11 +607,24 @@ impl BinDirectory {
                     None
                 }
             })
-            .for_each(|(i, p, t)| self.convert_or_cached(i, p, *t, overwrite).unwrap());
-        Ok(())
+            .map(|(i, p, t)| self.convert_or_cached(i, p, *t, overwrite))
+            .collect()
+    }
+
+    /// Convert a set of `TimestampRanges`
+    pub fn convert_timeranges(
+        &self,
+        tranges: Vec<TimestampRange>,
+        overwrite: bool,
+    ) -> Result<Vec<Vec<PathBuf>>, BinneyError> {
+        tranges
+            .par_iter()
+            .map(|t| self.convert_timerange(*t, overwrite))
+            .collect()
     }
 }
 
+/// The binney library provides several interfaces
 #[pymodule]
 fn binney(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BinDirectory>()?;
@@ -543,6 +638,7 @@ fn binney(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Command line interface
 #[pymodule]
 mod cli {
     use super::*;
@@ -598,7 +694,7 @@ mod cli {
                 .unwrap()
                 .convert_all(overwrite)
                 .unwrap(),
-        }
+        };
         Ok(())
     }
 

@@ -9,7 +9,33 @@ classifiers = [
     "Programming Language :: Rust"
 ]
 dynamic = ["version"]
-requires-python = ">=3.8"
+requires-python = "~=3.9"
+
+[project.optional-dependencies]
+polars = [
+    "polars-u64-idx[pyarrow]>=1.6.0",
+    "numpy>=1.26"
+]
 
 [project.scripts]
 binney-cli = "binney.cli:main"
+
+[tool.pdm.dev-dependencies]
+test = ["coverage"]
+docs = [
+    "pdoc>=14.6.1",
+]
+
+[tool.pdm.scripts]
+test.composite = ["test-code", "test-rust", "test-docs", "coverage-html"]
+test-code.env = {PYTHONWARNINGS = "error"}
+test-code.cmd = "python -m coverage run -m unittest discover -t . -s tests -v"
+test-rust.cmd = "cargo test"
+test-docs.cmd = "pdoc binney -o docs"
+
+document.cmd = "pdoc binney -o docs"
+document-live.cmd = "pdoc binney"
+
+coverage-text.cmd = "python -m coverage report"
+coverage-html.cmd = "python -m coverage html"
+coverage-xml.cmd  = "python -m coverage xml"
