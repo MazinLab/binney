@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0", "pip>=24.0"]
 build-backend = "maturin"
 
 [project]
-name = "binney"
+name = "pybinney"
 classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Rust"
@@ -19,6 +19,9 @@ polars = [
 
 [project.scripts]
 binney-cli = "binney.cli:main"
+
+[tool.pdm]
+ignore_package_warnings = ["pdoc"]
 
 [tool.pdm.dev-dependencies]
 test = ["coverage"]
@@ -39,3 +42,7 @@ document-live.cmd = "pdoc binney"
 coverage-text.cmd = "python -m coverage report"
 coverage-html.cmd = "python -m coverage html"
 coverage-xml.cmd  = "python -m coverage xml"
+
+[tool.maturin]
+bindings = "pyo3"
+compatibility = "manylinux2014"

@@ -43,20 +43,61 @@ jobs:
       run: |
         codecov
 
-  publish-package:
-    name: upload release to PyPI
+  build-release:
+    name: Build wheels
     runs-on: ubuntu-latest
     environment: publish-release
+    if: ${{ github.repository == 'MazinLab/binney' && github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags/v') && !contains(github.event.ref, 'dev') }}
     permissions:
       # This permission is needed for private repositories.
       contents: read
       # IMPORTANT: this permission is mandatory for trusted publishing
       id-token: write
     steps:
-      - uses: actions/checkout@v3
+      - name: Check out source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up PDM
+        uses: pdm-project/setup-pdm@v4
+        with:
+          python-version: '3.9'
+      - uses: PyO3/maturin-action@v1
+        with:
+          manylinux: manylinux2014
+          command: build
+          args: --release --out dist
+      - name: Upload wheels
+        uses: actions/upload-artifact@v3
+        with:
+          name: wheels
+          path: dist
+      - name: Install built wheel
+        run: pip install pybinney --no-index --find-links dist --force-reinstall
+      - name: Test built wheel
+        working-directory: /
+        run: python -c "import binney"
+      - name: Publish release
+        run: |
+          pdm publish --no-build -d dist --skip-existing
+      - name: Build Documentation
+        run: |
+          pdm install -G polars --dev
+          pdm document
+      - name: Upload docs
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
 
-      - uses: pdm-project/setup-pdm@v3
-
-      - name: Publish package distributions to PyPI
-        if: ${{ github.repository == 'MazinLab/binney' && github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags/v') && !contains(github.event.ref, 'dev') }}
-        run: pdm publish
+  deploy:
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

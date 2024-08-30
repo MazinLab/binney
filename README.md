@@ -4,9 +4,9 @@
 
 ## Instalation
 
-In theory this package is published on `pypi` as `mazinlab-binney`, so to get the `binney-cli` tool you can simply install it using the package manager of your choice, eg `pipx install mazinlab-binney`
+This package is published on `pypi` as `pybinney`, so to get the `binney-cli` tool you can simply install it using the package manager of your choice, eg `pipx install pybinney`
 
-For the library add `mazinlab-binney` as a dependency in your packages `pyproject.toml`
+For the library add `pybinney` as a dependency in your packages `pyproject.toml` and then `import binney`.
 
 ## Usage
 
