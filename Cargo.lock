@@ -224,11 +224,13 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "binney"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "hashbrown",
  "indicatif",
  "polars",
  "pyo3",
+ "pyo3-polars",
  "rayon",
  "winnow",
 ]
@@ -323,7 +325,9 @@ checksum = "a21f936df1771bf62b77f047b726c4625ff2e8aa607c01ec06e5a05bd8463401"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
+ "js-sys",
  "num-traits",
+ "wasm-bindgen",
  "windows-targets",
 ]
 
@@ -1606,6 +1610,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "831e8e819a138c36e212f3af3fd9eeffed6bf1510a805af35b0edee5ffa59433"
 dependencies = [
  "cfg-if",
+ "chrono",
+ "hashbrown",
  "indoc",
  "libc",
  "memoffset",
@@ -1661,6 +1667,20 @@ dependencies = [
  "pyo3-build-config",
  "quote",
  "syn 2.0.76",
+]
+
+[[package]]
+name = "pyo3-polars"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4888d52962f8433717f7ea7ab86c420720f2d89c00aa5712ec4d9353facb1ef"
+dependencies = [
+ "libc",
+ "once_cell",
+ "polars",
+ "polars-core",
+ "pyo3",
+ "thiserror",
 ]
 
 [[package]]
@@ -2073,9 +2093,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.39.3"
+version = "1.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9babc99b9923bfa4804bd74722ff02c0381021eafa4db9949217e3be8e84fff5"
+checksum = "e2b070231665d27ad9ec9b8df639893f46727666c6767db40317fbe920a5d998"
 dependencies = [
  "backtrace",
  "bytes",
