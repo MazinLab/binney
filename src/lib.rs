@@ -14,7 +14,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 
 use hashbrown::{HashMap, HashSet};
 
-use indicatif::ParallelProgressIterator;
+use indicatif::ProgressIterator;
 
 use polars::prelude::*;
 
@@ -984,20 +984,44 @@ impl BinDirectory {
     /// otherwise it will only overwrite a parquet file if the corresponding
     /// bin file has changed since the parquet file was last written
     pub fn convert_all(&self, overwrite: bool) -> Result<Vec<PathBuf>, BinneyError> {
-        if self.progress {
-            self.files
-                .par_iter()
-                .progress_count(self.files.len() as u64)
-                .enumerate()
-                .map(|(i, (bpath, t))| self.convert_or_cached(i, bpath, *t, overwrite))
-                .collect()
-        } else {
-            self.files
-                .par_iter()
-                .enumerate()
-                .map(|(i, (bpath, t))| self.convert_or_cached(i, bpath, *t, overwrite))
-                .collect()
-        }
+        let chunk_size = 256;
+        rayon::scope_fifo(|_s| {
+            if self.progress {
+                self.files
+                    .chunks(chunk_size)
+                    .progress_count(
+                        self.files.len() as u64 / chunk_size as u64
+                            + if self.files.len() % chunk_size == 0 {
+                                0
+                            } else {
+                                1
+                            },
+                    )
+                    .map(|s| {
+                        // Python::with_gil(|py| py.check_signals().unwrap());
+                        s.par_iter()
+                            .enumerate()
+                            .map(|(i, (bpath, t))| self.convert_or_cached(i, bpath, *t, overwrite))
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                    })
+                    .flatten()
+                    .collect()
+            } else {
+                self.files
+                    .chunks(chunk_size)
+                    .map(|s| {
+                        // Python::with_gil(|py| py.check_signals().unwrap());
+                        s.par_iter()
+                            .enumerate()
+                            .map(|(i, (bpath, t))| self.convert_or_cached(i, bpath, *t, overwrite))
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                    })
+                    .flatten()
+                    .collect()
+            }
+        })
     }
 
     /// Convert a `TimestampRange` length
