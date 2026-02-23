@@ -34,7 +34,6 @@ jobs:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
-        sudo apt-get update
         pip install codecov build
         pdm install --dev
     - name: Run tests
@@ -89,6 +88,43 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs
+
+  build-release-macos:
+    name: Build wheels macos
+    runs-on: macos-latest
+    environment: publish-release
+    if: ${{ github.repository == 'MazinLab/binney' && github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags/v') && !contains(github.event.ref, 'dev') }}
+    permissions:
+      # This permission is needed for private repositories.
+      contents: read
+      # IMPORTANT: this permission is mandatory for trusted publishing
+      id-token: write
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up PDM
+        uses: pdm-project/setup-pdm@v4
+        with:
+          python-version: '3.10'
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist
+      - name: Install built wheel
+        run: pip install pybinney --no-index --find-links dist --force-reinstall
+      - name: Test built wheel
+        working-directory: /
+        run: python -c "import binney"
+      - name: Publish release
+        run: |
+          pdm publish --no-build -d dist --skip-existing
 
   deploy:
     needs: build-release
