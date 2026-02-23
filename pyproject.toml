@@ -9,7 +9,7 @@ classifiers = [
     "Programming Language :: Rust"
 ]
 dynamic = ["version"]
-requires-python = "~=3.9"
+requires-python = "~=3.10"
 
 [project.optional-dependencies]
 polars = [
@@ -26,7 +26,7 @@ ignore_package_warnings = ["pdoc"]
 [tool.pdm.dev-dependencies]
 test = ["coverage"]
 docs = [
-    "pdoc>=14.6.1",
+    "pdoc>=16.0.0",
 ]
 
 [tool.pdm.scripts]
