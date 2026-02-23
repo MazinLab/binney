@@ -1,18 +1,18 @@
 [package]
 name = "binney"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 
 [dependencies]
-chrono = "0.4.38"
-clap = { version = "4.5.16", features = ["derive"] }
-hashbrown = "0.14.5"
-indicatif = { version = "0.17.8", features = ["rayon"] }
-polars = { version = "0.42.0", features = ["ndarray", "bigidx", "performant", "lazy", "parquet", "ipc", "fmt", "streaming", "dynamic_group_by"] }
-pyo3 = { version = "0.22.2", features = ["extension-module", "generate-import-lib", "abi3-py39", "chrono", "hashbrown"] }
-pyo3-polars = { version = "0.16.1", features = ["dtype-struct"] }
-rayon = "1.10.0"
-winnow = { version = "0.6.18", features = ["simd"] }
+chrono = { version = "0.4.41", features = ["std"] }
+clap = { version = "4.5.60", features = ["derive"] }
+hashbrown = "0.16.1"
+indicatif = { version = "0.18.4", features = ["rayon"] }
+polars = { version = "0.53.0", features = ["ndarray", "bigidx", "performant", "lazy", "parquet", "ipc", "fmt", "dynamic_group_by"] }
+pyo3 = { version = "0.27", features = ["extension-module", "generate-import-lib", "abi3-py39", "chrono", "hashbrown"] }
+pyo3-polars = { version = "0.26.0", features = ["dtype-struct"] }
+rayon = "1.11.0"
+winnow = { version = "0.7.14", features = ["simd"] }
 
 [lib]
 name = "binney"

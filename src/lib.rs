@@ -84,7 +84,7 @@ pub struct Photons {
 }
 
 fn tableschema() -> Schema {
-    let mut s = Schema::new();
+    let mut s = Schema::default();
     s.with_column("xy".into(), DataType::UInt16);
     s.with_column("timestamp".into(), DataType::Int64);
     s.with_column("phase".into(), DataType::Int32);
@@ -213,7 +213,7 @@ impl BinSerializer {
     /// See `binney.BinSerializer.serialize_pydataframe`
     pub fn serialize_dataframe(&self, df: &mut DataFrame) -> Result<(), BinneyError> {
         let ene = || BinneyError::SerializationError("Cannot have empty slot".into());
-        if df.schema() != tableschema() {
+        if **df.schema() != tableschema() {
             return Err(BinneyError::SerializationError(format!(
                 "Got a table with schema {:#?}, expected {:#?}",
                 df.schema(),
@@ -221,12 +221,28 @@ impl BinSerializer {
             )));
         }
 
-        let max = df.clone().column("timestamp")?.max::<i64>()?.ok_or(
-            BinneyError::SerializationError("timestamp column empty".into()),
-        )?;
-        let min = df.clone().column("timestamp")?.min::<i64>()?.ok_or(
-            BinneyError::SerializationError("timestamp column empty".into()),
-        )?;
+        let max = df
+            .clone()
+            .column("timestamp")?
+            .as_series()
+            .ok_or(BinneyError::SerializationError(
+                "timestamp column was scalar not series".into(),
+            ))?
+            .max::<i64>()?
+            .ok_or(BinneyError::SerializationError(
+                "timestamp column empty".into(),
+            ))?;
+        let min = df
+            .clone()
+            .column("timestamp")?
+            .as_series()
+            .ok_or(BinneyError::SerializationError(
+                "timestamp column was scalar not series".into(),
+            ))?
+            .min::<i64>()?
+            .ok_or(BinneyError::SerializationError(
+                "timestamp column empty".into(),
+            ))?;
 
         let start_sec = ((min + self.skew) / (1000 * 1000)) + self.reference_time.timestamp();
 
@@ -263,9 +279,12 @@ impl BinSerializer {
                 "Could not find a board mapping for all pixels in the dataframe".into(),
             ))?;
 
-        let ldf = df.with_column(Series::new("board", board))?.clone().lazy();
+        let ldf = df
+            .with_column(Column::new("board".into(), board))?
+            .clone()
+            .lazy();
 
-        let mut schema = Schema::new();
+        let mut schema = Schema::default();
         schema.with_column("length".into(), DataType::UInt64);
 
         let df = ldf
@@ -431,12 +450,12 @@ impl From<Vec<Photon>> for Photons {
 impl TryInto<DataFrame> for Photons {
     type Error = BinneyError;
     fn try_into(self) -> Result<DataFrame, Self::Error> {
-        let xys = Series::new("xy", self.xy);
-        let ts = Series::new("timestamp", self.timestamp);
-        let ps = Series::new("phase", self.phase);
-        let bs = Series::new("baseline", self.baseline);
+        let xys = Column::new("xy".into(), self.xy);
+        let ts = Column::new("timestamp".into(), self.timestamp);
+        let ps = Column::new("phase".into(), self.phase);
+        let bs = Column::new("baseline".into(), self.baseline);
 
-        Ok(DataFrame::new(vec![xys, ts, ps, bs])?)
+        Ok(DataFrame::new(xys.len(), vec![xys, ts, ps, bs])?)
     }
 }
 
@@ -642,7 +661,7 @@ fn stream(b: &[u8]) -> Stream<'_> {
 }
 
 #[inline]
-fn parse_header(input: &mut Stream<'_>) -> PResult<HeaderPacket> {
+fn parse_header(input: &mut Stream<'_>) -> ModalResult<HeaderPacket> {
     let fields: (u8, u8, u16, i64) = bits::<_, _, ContextError<(&str, usize)>, _, _>((
         take(8usize).verify(|i| *i == 0xff),
         take(8usize),
@@ -652,7 +671,7 @@ fn parse_header(input: &mut Stream<'_>) -> PResult<HeaderPacket> {
     .parse_next(input)
     .map_err(|_| ErrMode::<ContextError>::Cut(ContextError::new()))?;
 
-    PResult::Ok(HeaderPacket {
+    ModalResult::Ok(HeaderPacket {
         board: fields.1,
         frame: fields.2,
         timestamp: fields.3,
@@ -660,7 +679,7 @@ fn parse_header(input: &mut Stream<'_>) -> PResult<HeaderPacket> {
 }
 
 #[inline]
-fn parse_data(input: &mut Stream<'_>) -> PResult<DataPacket> {
+fn parse_data(input: &mut Stream<'_>) -> ModalResult<DataPacket> {
     let fields: (u16, u16, u16, i32, i32) = bits::<_, _, ContextError<(String, usize)>, _, _>((
         // We verify that this is not a padding packet or a header packet
         take(10usize).verify(|i| *i < 256),
@@ -673,7 +692,7 @@ fn parse_data(input: &mut Stream<'_>) -> PResult<DataPacket> {
     .parse_next(input)
     .map_err(|_| ErrMode::<ContextError>::Cut(ContextError::new()))?;
 
-    PResult::Ok(DataPacket {
+    ModalResult::Ok(DataPacket {
         x: fields.0 as u8,
         y: fields.1 as u8,
         timestamp: fields.2,
@@ -687,7 +706,7 @@ fn complete_packet(
     header: HeaderPacket,
     storage: &mut Photons,
     input: &mut Stream<'_>,
-) -> PResult<()> {
+) -> ModalResult<()> {
     while let Ok(packet) = parse_data.parse_next(input) {
         storage.xy.push(packet.y as u16 | ((packet.x as u16) << 8));
         storage
@@ -703,7 +722,7 @@ fn complete_packet(
     Ok(())
 }
 
-fn parse_packet(storage: &mut Photons, input: &mut Stream<'_>) -> PResult<HeaderPacket> {
+fn parse_packet(storage: &mut Photons, input: &mut Stream<'_>) -> ModalResult<HeaderPacket> {
     let header = parse_header.parse_next(input)?;
     complete_packet(header, storage, input)?;
     Ok(header)
@@ -758,12 +777,12 @@ pub fn read_file(
 
 fn to_dataframe(binfile: &mut File) -> Result<(DataFrame, HeaderPacket), BinneyError> {
     let (photons, header) = read_file(binfile, None)?;
-    let xys = Series::new("xy", photons.xy);
-    let ts = Series::new("timestamp", photons.timestamp);
-    let ps = Series::new("phase", photons.phase);
-    let bs = Series::new("baseline", photons.baseline);
+    let xys = Column::new("xy".into(), photons.xy);
+    let ts = Column::new("timestamp".into(), photons.timestamp);
+    let ps = Column::new("phase".into(), photons.phase);
+    let bs = Column::new("baseline".into(), photons.baseline);
 
-    Ok((DataFrame::new(vec![xys, ts, ps, bs])?, header))
+    Ok((DataFrame::new(xys.len(), vec![xys, ts, ps, bs])?, header))
 }
 
 pub fn to_parquet(binfile: &mut File, parquet: &mut File) -> Result<HeaderPacket, BinneyError> {
@@ -775,7 +794,6 @@ pub fn to_parquet(binfile: &mut File, parquet: &mut File) -> Result<HeaderPacket
     )?;
 
     ParquetWriter::new(parquet).finish(&mut df)?;
-    df.clear();
 
     Ok(header)
 }
@@ -1112,7 +1130,7 @@ mod cli {
         use clap::Parser;
 
         let argv = py
-            .import_bound("sys")
+            .import("sys")
             .unwrap()
             .getattr("argv")
             .unwrap()
@@ -1156,8 +1174,8 @@ mod cli {
     /// Hack: workaround for https://github.com/PyO3/pyo3/issues/759
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
-        Python::with_gil(|py| {
-            py.import_bound("sys")?
+        Python::attach(|py| {
+            py.import("sys")?
                 .getattr("modules")?
                 .set_item("binney.cli", m)
         })
