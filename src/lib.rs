@@ -617,8 +617,7 @@ pub struct DataPacket {
 
 impl SerializePacket for DataPacket {
     fn serialize(&self) -> [u8; 8] {
-        let mut packet = 0xff00_0000_0000_0000u64;
-        packet |= (self.x as u64).wrapping_shl(64 - 10);
+        let mut packet = (self.x as u64).wrapping_shl(64 - 10);
         packet |= (self.y as u64).wrapping_shl(64 - 10 - 10);
         packet |= (self.timestamp as u64 & 0x1ff).wrapping_shl(64 - 10 - 10 - 9);
         packet |= (self.phase as u64 & 0x3ffff).wrapping_shl(64 - 10 - 10 - 9 - 18);
@@ -685,9 +684,10 @@ fn parse_data(input: &mut Stream<'_>) -> ModalResult<DataPacket> {
         take(10usize).verify(|i| *i < 256),
         take(10usize).verify(|i| *i < 256),
         take(9usize),
-        // Use an arithmetic right shift to sign extend these
-        take(18usize).map(|input: i32| input.wrapping_shl(32 - 17).wrapping_shr(32 - 17)),
-        take(17usize).map(|input: i32| input.wrapping_shl(32 - 16).wrapping_shr(32 - 16)),
+        // Phase and baseline are 18- and 17-bit two's complement fields;
+        // shift each field's sign bit into bit 31, then arithmetic-shift back
+        take(18usize).map(|input: i32| input.wrapping_shl(32 - 18).wrapping_shr(32 - 18)),
+        take(17usize).map(|input: i32| input.wrapping_shl(32 - 17).wrapping_shr(32 - 17)),
     ))
     .parse_next(input)
     .map_err(|_| ErrMode::<ContextError>::Cut(ContextError::new()))?;
@@ -1227,6 +1227,16 @@ mod tests {
     }
 
     #[test]
+    fn test_data_full_width_sign_extension() {
+        // Values outside the 17-bit phase / 16-bit baseline range, including a real
+        // MEC 850 nm photon (phase -100212), must not wrap to the opposite sign
+        for (phase, baseline) in [(-100212, -9286), (-131072, -65536), (131071, 65535), (-65537, -32769)] {
+            let packet = DataPacket { x: 99, y: 44, timestamp: 131, phase, baseline };
+            assert_eq!(parse_data(&mut stream(&packet.serialize())), Ok(packet));
+        }
+    }
+
+    #[test]
     fn test_header() {
         let mut input_header = stream(&[0xff, 0xe8, 0x76, 0x0b, 0x46, 0x72, 0x2c, 0xfb]);
         assert_eq!(
@@ -1254,7 +1264,9 @@ mod tests {
             })
         );
 
-        assert_eq!(input_data, stream(&[]))
+        assert_eq!(input_data, stream(&[]));
+        let packet = DataPacket { x: 99, y: 44, timestamp: 131, phase: -34148, baseline: -4334 };
+        assert_eq!(packet.serialize(), [0x18, 0xc2, 0xc4, 0x1e, 0xf5, 0x39, 0xef, 0x12]);
     }
 
     #[test]
